@@ -7,7 +7,10 @@ import (
 	"time"
 )
 
-var ErrConflict = errors.New("комната уже занята на это время")
+var (
+	ErrConflict = errors.New("комната уже занята на это время")
+	ErrNotFound = errors.New("брони с таким id нет")
+)
 
 type Store struct {
 	mu    sync.RWMutex
@@ -36,6 +39,25 @@ func (s *Store) Create(room string, start, end time.Time) (Booking, error) {
 	b := Booking{ID: id, Room: room, Start: start, End: end}
 	s.rooms[room] = append(s.rooms[room], b)
 	return b, nil
+}
+
+func (s *Store) Delete(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for room, bookings := range s.rooms {
+		for i, b := range bookings {
+			if b.ID != id {
+				continue
+			}
+			s.rooms[room] = append(bookings[:i], bookings[i+1:]...)
+			if len(s.rooms[room]) == 0 {
+				delete(s.rooms, room)
+			}
+			return nil
+		}
+	}
+	return ErrNotFound
 }
 
 func (s *Store) ListByDate(room string, date time.Time) []Booking {
