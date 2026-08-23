@@ -21,6 +21,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /bookings", h.create)
 	mux.HandleFunc("GET /bookings", h.list)
 	mux.HandleFunc("DELETE /bookings/{id}", h.cancel)
+	mux.HandleFunc("POST /bookings/{id}/restore", h.restore)
 }
 
 type createRequest struct {
@@ -106,6 +107,24 @@ func (h *Handler) cancel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) restore(w http.ResponseWriter, r *http.Request) {
+	b, err := h.store.Restore(r.PathValue("id"))
+	switch {
+	case errors.Is(err, ErrNotFound):
+		writeError(w, http.StatusNotFound, err.Error())
+	case errors.Is(err, ErrNotCancelled):
+		writeError(w, http.StatusBadRequest, err.Error())
+	case errors.Is(err, ErrRestoreExpired):
+		writeError(w, http.StatusGone, err.Error())
+	case errors.Is(err, ErrConflict):
+		writeError(w, http.StatusConflict, err.Error())
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, "внутренняя ошибка")
+	default:
+		writeJSON(w, http.StatusOK, b)
+	}
 }
 
 func parseUTC(raw string) (time.Time, error) {

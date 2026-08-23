@@ -8,10 +8,11 @@ import (
 )
 
 type Booking struct {
-	ID    string    `json:"id"`
-	Room  string    `json:"room"`
-	Start time.Time `json:"start"`
-	End   time.Time `json:"end"`
+	ID          string     `json:"id"`
+	Room        string     `json:"room"`
+	Start       time.Time  `json:"start"`
+	End         time.Time  `json:"end"`
+	CancelledAt *time.Time `json:"-"`
 }
 
 func newID() (string, error) {

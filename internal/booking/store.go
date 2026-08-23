@@ -8,17 +8,21 @@ import (
 )
 
 var (
-	ErrConflict = errors.New("комната уже занята на это время")
-	ErrNotFound = errors.New("брони с таким id нет")
+	ErrConflict       = errors.New("комната уже занята на это время")
+	ErrNotFound       = errors.New("брони с таким id нет")
+	ErrNotCancelled   = errors.New("бронь не отменена")
+	ErrRestoreExpired = errors.New("окно восстановления истекло")
 )
 
 type Store struct {
-	mu    sync.RWMutex
-	rooms map[string][]Booking
+	mu            sync.RWMutex
+	rooms         map[string][]Booking
+	now           func() time.Time
+	restoreWindow time.Duration
 }
 
-func NewStore() *Store {
-	return &Store{rooms: make(map[string][]Booking)}
+func NewStore(now func() time.Time, restoreWindow time.Duration) *Store {
+	return &Store{rooms: make(map[string][]Booking), now: now, restoreWindow: restoreWindow}
 }
 
 func (s *Store) Create(room string, start, end time.Time) (Booking, error) {
@@ -31,6 +35,9 @@ func (s *Store) Create(room string, start, end time.Time) (Booking, error) {
 	defer s.mu.Unlock()
 
 	for _, b := range s.rooms[room] {
+		if b.CancelledAt != nil {
+			continue
+		}
 		if start.Before(b.End) && b.Start.Before(end) {
 			return Booking{}, ErrConflict
 		}
@@ -47,17 +54,44 @@ func (s *Store) Delete(id string) error {
 
 	for room, bookings := range s.rooms {
 		for i, b := range bookings {
-			if b.ID != id {
+			if b.ID != id || b.CancelledAt != nil {
 				continue
 			}
-			s.rooms[room] = append(bookings[:i], bookings[i+1:]...)
-			if len(s.rooms[room]) == 0 {
-				delete(s.rooms, room)
-			}
+			cancelled := s.now()
+			b.CancelledAt = &cancelled
+			s.rooms[room][i] = b
 			return nil
 		}
 	}
 	return ErrNotFound
+}
+
+func (s *Store) Restore(id string) (Booking, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, bookings := range s.rooms {
+		for i, b := range bookings {
+			if b.ID != id {
+				continue
+			}
+			if b.CancelledAt == nil {
+				return Booking{}, ErrNotCancelled
+			}
+			if s.now().Sub(*b.CancelledAt) > s.restoreWindow {
+				return Booking{}, ErrRestoreExpired
+			}
+			for _, other := range bookings {
+				if other.CancelledAt == nil && b.Start.Before(other.End) && other.Start.Before(b.End) {
+					return Booking{}, ErrConflict
+				}
+			}
+			b.CancelledAt = nil
+			bookings[i] = b
+			return b, nil
+		}
+	}
+	return Booking{}, ErrNotFound
 }
 
 func (s *Store) ListByDate(room string, date time.Time) []Booking {
@@ -69,6 +103,9 @@ func (s *Store) ListByDate(room string, date time.Time) []Booking {
 
 	out := make([]Booking, 0)
 	for _, b := range s.rooms[room] {
+		if b.CancelledAt != nil {
+			continue
+		}
 		if !b.Start.Before(dayStart) && b.Start.Before(dayEnd) {
 			out = append(out, b)
 		}
