@@ -1,0 +1,298 @@
+package booking
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+)
+
+func newServer() *http.ServeMux {
+	mux := http.NewServeMux()
+	NewHandler(NewStore()).Register(mux)
+	return mux
+}
+
+func post(t *testing.T, mux *http.ServeMux, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/bookings", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	return rec
+}
+
+func get(t *testing.T, mux *http.ServeMux, query string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/bookings?"+query, nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestCreateSuccess(t *testing.T) {
+	mux := newServer()
+
+	rec := post(t, mux, `{"room":"green","start":"2026-08-24T10:00:00Z","end":"2026-08-24T11:00:00Z"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("код ответа = %d, хотим %d; тело %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+
+	var got Booking
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("разобрать ответ: %v", err)
+	}
+	if len(got.ID) != 16 {
+		t.Fatalf("длина id = %d, хотим 16 (%q)", len(got.ID), got.ID)
+	}
+	if got.Room != "green" {
+		t.Fatalf("room = %q, хотим %q", got.Room, "green")
+	}
+	if got.Start.Format("15:04") != "10:00" || got.End.Format("15:04") != "11:00" {
+		t.Fatalf("интервал = %s–%s, хотим 10:00–11:00", got.Start, got.End)
+	}
+}
+
+func TestCreateSecondBooking(t *testing.T) {
+	tests := []struct {
+		name  string
+		first string
+		body  string
+		want  int
+	}{
+		{
+			name:  "полное совпадение",
+			first: `{"room":"green","start":"2026-08-24T10:00:00Z","end":"2026-08-24T11:00:00Z"}`,
+			body:  `{"room":"green","start":"2026-08-24T10:00:00Z","end":"2026-08-24T11:00:00Z"}`,
+			want:  http.StatusConflict,
+		},
+		{
+			name:  "частичное пересечение слева",
+			first: `{"room":"green","start":"2026-08-24T10:00:00Z","end":"2026-08-24T11:00:00Z"}`,
+			body:  `{"room":"green","start":"2026-08-24T09:30:00Z","end":"2026-08-24T10:30:00Z"}`,
+			want:  http.StatusConflict,
+		},
+		{
+			name:  "частичное пересечение справа",
+			first: `{"room":"green","start":"2026-08-24T10:00:00Z","end":"2026-08-24T11:00:00Z"}`,
+			body:  `{"room":"green","start":"2026-08-24T10:30:00Z","end":"2026-08-24T12:00:00Z"}`,
+			want:  http.StatusConflict,
+		},
+		{
+			name:  "вложенный интервал",
+			first: `{"room":"green","start":"2026-08-24T10:00:00Z","end":"2026-08-24T12:00:00Z"}`,
+			body:  `{"room":"green","start":"2026-08-24T10:30:00Z","end":"2026-08-24T11:00:00Z"}`,
+			want:  http.StatusConflict,
+		},
+		{
+			name:  "объемлющий интервал",
+			first: `{"room":"green","start":"2026-08-24T10:30:00Z","end":"2026-08-24T11:00:00Z"}`,
+			body:  `{"room":"green","start":"2026-08-24T10:00:00Z","end":"2026-08-24T12:00:00Z"}`,
+			want:  http.StatusConflict,
+		},
+		{
+			name:  "то же время в другой комнате",
+			first: `{"room":"green","start":"2026-08-24T10:00:00Z","end":"2026-08-24T11:00:00Z"}`,
+			body:  `{"room":"red","start":"2026-08-24T10:00:00Z","end":"2026-08-24T11:00:00Z"}`,
+			want:  http.StatusCreated,
+		},
+		{
+			name:  "непересекающийся интервал",
+			first: `{"room":"green","start":"2026-08-24T10:00:00Z","end":"2026-08-24T11:00:00Z"}`,
+			body:  `{"room":"green","start":"2026-08-24T14:00:00Z","end":"2026-08-24T15:00:00Z"}`,
+			want:  http.StatusCreated,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mux := newServer()
+			if rec := post(t, mux, tt.first); rec.Code != http.StatusCreated {
+				t.Fatalf("первая бронь: код %d, тело %s", rec.Code, rec.Body.String())
+			}
+
+			rec := post(t, mux, tt.body)
+			if rec.Code != tt.want {
+				t.Fatalf("код ответа = %d, хотим %d; тело %s", rec.Code, tt.want, rec.Body.String())
+			}
+			if tt.want == http.StatusConflict {
+				assertErrorBody(t, rec)
+			}
+		})
+	}
+}
+
+func TestCreateValidation(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "невалидный JSON", body: `{"room": "green"`},
+		{name: "пустое тело", body: ``},
+		{name: "пустая комната", body: `{"room":"","start":"2026-08-24T10:00:00Z","end":"2026-08-24T11:00:00Z"}`},
+		{name: "нет комнаты", body: `{"start":"2026-08-24T10:00:00Z","end":"2026-08-24T11:00:00Z"}`},
+		{name: "нет start", body: `{"room":"green","end":"2026-08-24T11:00:00Z"}`},
+		{name: "нет end", body: `{"room":"green","start":"2026-08-24T10:00:00Z"}`},
+		{name: "неизвестный формат start", body: `{"room":"green","start":"24.08.2026 10:00","end":"2026-08-24T11:00:00Z"}`},
+		{name: "неизвестный формат end", body: `{"room":"green","start":"2026-08-24T10:00:00Z","end":"завтра"}`},
+		{name: "start не в UTC", body: `{"room":"green","start":"2026-08-24T10:00:00+03:00","end":"2026-08-24T11:00:00Z"}`},
+		{name: "end не в UTC", body: `{"room":"green","start":"2026-08-24T10:00:00Z","end":"2026-08-24T14:00:00+03:00"}`},
+		{name: "end равен start", body: `{"room":"green","start":"2026-08-24T10:00:00Z","end":"2026-08-24T10:00:00Z"}`},
+		{name: "end меньше start", body: `{"room":"green","start":"2026-08-24T11:00:00Z","end":"2026-08-24T10:00:00Z"}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mux := newServer()
+			rec := post(t, mux, tt.body)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("код ответа = %d, хотим %d; тело %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+			assertErrorBody(t, rec)
+		})
+	}
+}
+
+func TestListSortedAndFiltered(t *testing.T) {
+	mux := newServer()
+	seed := []string{
+		`{"room":"green","start":"2026-08-24T15:00:00Z","end":"2026-08-24T16:00:00Z"}`,
+		`{"room":"green","start":"2026-08-24T09:00:00Z","end":"2026-08-24T09:30:00Z"}`,
+		`{"room":"green","start":"2026-08-24T12:00:00Z","end":"2026-08-24T13:00:00Z"}`,
+		`{"room":"green","start":"2026-08-25T08:00:00Z","end":"2026-08-25T09:00:00Z"}`,
+		`{"room":"red","start":"2026-08-24T10:00:00Z","end":"2026-08-24T11:00:00Z"}`,
+	}
+	for _, body := range seed {
+		if rec := post(t, mux, body); rec.Code != http.StatusCreated {
+			t.Fatalf("подготовка брони %s: код %d, тело %s", body, rec.Code, rec.Body.String())
+		}
+	}
+
+	tests := []struct {
+		name  string
+		query string
+		want  []string
+	}{
+		{
+			name:  "сутки комнаты green",
+			query: "room=green&date=2026-08-24",
+			want:  []string{"09:00", "12:00", "15:00"},
+		},
+		{
+			name:  "следующие сутки",
+			query: "room=green&date=2026-08-25",
+			want:  []string{"08:00"},
+		},
+		{
+			name:  "сутки без броней",
+			query: "room=green&date=2026-08-26",
+			want:  []string{},
+		},
+		{
+			name:  "другая комната",
+			query: "room=red&date=2026-08-24",
+			want:  []string{"10:00"},
+		},
+		{
+			name:  "неизвестная комната",
+			query: "room=blue&date=2026-08-24",
+			want:  []string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := get(t, mux, tt.query)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("код ответа = %d, хотим %d; тело %s", rec.Code, http.StatusOK, rec.Body.String())
+			}
+
+			var got listResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+				t.Fatalf("разобрать ответ: %v", err)
+			}
+			if len(got.Bookings) != len(tt.want) {
+				t.Fatalf("броней = %d, хотим %d (%s)", len(got.Bookings), len(tt.want), rec.Body.String())
+			}
+			for i, want := range tt.want {
+				if got := got.Bookings[i].Start.Format("15:04"); got != want {
+					t.Fatalf("бронь %d начинается в %s, хотим %s", i, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestListValidation(t *testing.T) {
+	tests := []struct {
+		name  string
+		query string
+	}{
+		{name: "нет room", query: "date=2026-08-24"},
+		{name: "пустой room", query: "room=&date=2026-08-24"},
+		{name: "нет date", query: "room=green"},
+		{name: "неразборчивый date", query: "room=green&date=24-08-2026"},
+		{name: "date с временем", query: "room=green&date=2026-08-24T10:00:00Z"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mux := newServer()
+			rec := get(t, mux, tt.query)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("код ответа = %d, хотим %d; тело %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+			assertErrorBody(t, rec)
+		})
+	}
+}
+
+func TestCreateConcurrent(t *testing.T) {
+	mux := newServer()
+
+	const goroutines = 50
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		created int
+		other   []int
+	)
+
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			rec := post(t, mux, `{"room":"green","start":"2026-08-24T10:00:00Z","end":"2026-08-24T11:00:00Z"}`)
+
+			mu.Lock()
+			defer mu.Unlock()
+			switch rec.Code {
+			case http.StatusCreated:
+				created++
+			case http.StatusConflict:
+			default:
+				other = append(other, rec.Code)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if created != 1 {
+		t.Fatalf("успешных броней = %d, хотим 1", created)
+	}
+	if len(other) != 0 {
+		t.Fatalf("неожиданные коды ответов: %v", other)
+	}
+}
+
+func assertErrorBody(t *testing.T, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	var body map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("разобрать тело ошибки: %v (%s)", err, rec.Body.String())
+	}
+	if body["error"] == "" {
+		t.Fatalf("тело ошибки без поля error: %s", rec.Body.String())
+	}
+}

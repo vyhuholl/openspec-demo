@@ -1,0 +1,56 @@
+package booking
+
+import (
+	"errors"
+	"sort"
+	"sync"
+	"time"
+)
+
+var ErrConflict = errors.New("комната уже занята на это время")
+
+type Store struct {
+	mu    sync.RWMutex
+	rooms map[string][]Booking
+}
+
+func NewStore() *Store {
+	return &Store{rooms: make(map[string][]Booking)}
+}
+
+func (s *Store) Create(room string, start, end time.Time) (Booking, error) {
+	id, err := newID()
+	if err != nil {
+		return Booking{}, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, b := range s.rooms[room] {
+		if start.Before(b.End) && b.Start.Before(end) {
+			return Booking{}, ErrConflict
+		}
+	}
+
+	b := Booking{ID: id, Room: room, Start: start, End: end}
+	s.rooms[room] = append(s.rooms[room], b)
+	return b, nil
+}
+
+func (s *Store) ListByDate(room string, date time.Time) []Booking {
+	dayStart := date.UTC().Truncate(24 * time.Hour)
+	dayEnd := dayStart.AddDate(0, 0, 1)
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := make([]Booking, 0)
+	for _, b := range s.rooms[room] {
+		if !b.Start.Before(dayStart) && b.Start.Before(dayEnd) {
+			out = append(out, b)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Start.Before(out[j].Start) })
+	return out
+}
