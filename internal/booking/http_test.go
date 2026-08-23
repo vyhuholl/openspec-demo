@@ -7,12 +7,19 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
-func newServer() *http.ServeMux {
+var testNow = time.Date(2026, 8, 24, 9, 0, 0, 0, time.UTC)
+
+func newServerAtTime(now func() time.Time) *http.ServeMux {
 	mux := http.NewServeMux()
-	NewHandler(NewStore()).Register(mux)
+	NewHandler(NewStore(now, 10*time.Minute)).Register(mux)
 	return mux
+}
+
+func newServer() *http.ServeMux {
+	return newServerAtTime(func() time.Time { return testNow })
 }
 
 func post(t *testing.T, mux *http.ServeMux, body string) *httptest.ResponseRecorder {
@@ -457,6 +464,241 @@ func TestDeleteConcurrent(t *testing.T) {
 	}
 	if len(other) != 0 {
 		t.Fatalf("неожиданные коды ответов: %v", other)
+	}
+}
+
+func TestCreate_OverCancelled_CreatedAndSingleInList(t *testing.T) {
+	mux := newServer()
+	body := `{"room":"green","start":"2026-08-24T10:00:00Z","end":"2026-08-24T11:00:00Z"}`
+	a := createBooking(t, mux, body)
+	if rec := del(t, mux, a.ID); rec.Code != http.StatusNoContent {
+		t.Fatalf("отмена: код %d, тело %s", rec.Code, rec.Body.String())
+	}
+
+	b := createBooking(t, mux, body)
+
+	list := get(t, mux, "room=green&date=2026-08-24")
+	var got listResponse
+	if err := json.Unmarshal(list.Body.Bytes(), &got); err != nil {
+		t.Fatalf("разобрать ответ: %v", err)
+	}
+	if len(got.Bookings) != 1 {
+		t.Fatalf("броней в выдаче = %d, хотим 1 (%s)", len(got.Bookings), list.Body.String())
+	}
+	if got.Bookings[0].ID != b.ID {
+		t.Fatalf("в выдаче бронь %s, хотим %s", got.Bookings[0].ID, b.ID)
+	}
+}
+
+func restore(t *testing.T, mux *http.ServeMux, id string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/bookings/"+id+"/restore", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	return rec
+}
+
+func cancelAndAdvance(t *testing.T, mux *http.ServeMux, now *time.Time, id string, elapsed time.Duration) {
+	t.Helper()
+	if rec := del(t, mux, id); rec.Code != http.StatusNoContent {
+		t.Fatalf("отмена: код %d, тело %s", rec.Code, rec.Body.String())
+	}
+	*now = testNow.Add(elapsed)
+}
+
+func listCount(t *testing.T, mux *http.ServeMux, query string) (listResponse, int) {
+	t.Helper()
+	rec := get(t, mux, query)
+	var got listResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("разобрать ответ: %v", err)
+	}
+	return got, len(got.Bookings)
+}
+
+func TestRestore_WithinWindow_RestoredAndListed(t *testing.T) {
+	now := testNow
+	mux := newServerAtTime(func() time.Time { return now })
+	b := createBooking(t, mux, `{"room":"green","start":"2026-08-24T10:00:00Z","end":"2026-08-24T11:00:00Z"}`)
+	cancelAndAdvance(t, mux, &now, b.ID, 5*time.Minute)
+
+	rec := restore(t, mux, b.ID)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("код ответа = %d, хотим %d; тело %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var raw map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("разобрать ответ: %v", err)
+	}
+	if len(raw) != 4 {
+		t.Fatalf("полей в ответе = %d, хотим 4 (id, room, start, end): %s", len(raw), rec.Body.String())
+	}
+	var got Booking
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("разобрать ответ: %v", err)
+	}
+	if got.ID != b.ID || got.Room != "green" || got.Start.Format(time.RFC3339) != "2026-08-24T10:00:00Z" || got.End.Format(time.RFC3339) != "2026-08-24T11:00:00Z" {
+		t.Fatalf("восстановленная бронь = %+v, хотим исходную %s green 10:00–11:00", got, b.ID)
+	}
+
+	if _, count := listCount(t, mux, "room=green&date=2026-08-24"); count != 1 {
+		t.Fatalf("броней в выдаче = %d, хотим 1", count)
+	}
+}
+
+func TestRestore_ExactlyAtWindowEdge_Restored(t *testing.T) {
+	now := testNow
+	mux := newServerAtTime(func() time.Time { return now })
+	b := createBooking(t, mux, `{"room":"green","start":"2026-08-24T10:00:00Z","end":"2026-08-24T11:00:00Z"}`)
+	cancelAndAdvance(t, mux, &now, b.ID, 10*time.Minute)
+
+	rec := restore(t, mux, b.ID)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("код ответа = %d, хотим %d; тело %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var got Booking
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("разобрать ответ: %v", err)
+	}
+	if got.ID != b.ID || got.Room != "green" {
+		t.Fatalf("восстановленная бронь = %+v, хотим id %s green", got, b.ID)
+	}
+}
+
+func TestRestore_UnknownId_NotFound(t *testing.T) {
+	mux := newServer()
+
+	rec := restore(t, mux, "deadbeef")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("код ответа = %d, хотим %d; тело %s", rec.Code, http.StatusNotFound, rec.Body.String())
+	}
+	assertErrorBody(t, rec)
+}
+
+func TestRestore_WindowExpired_Gone(t *testing.T) {
+	now := testNow
+	mux := newServerAtTime(func() time.Time { return now })
+	b := createBooking(t, mux, `{"room":"green","start":"2026-08-24T10:00:00Z","end":"2026-08-24T11:00:00Z"}`)
+	cancelAndAdvance(t, mux, &now, b.ID, 11*time.Minute)
+
+	rec := restore(t, mux, b.ID)
+	if rec.Code != http.StatusGone {
+		t.Fatalf("код ответа = %d, хотим %d; тело %s", rec.Code, http.StatusGone, rec.Body.String())
+	}
+	assertErrorBody(t, rec)
+
+	if _, count := listCount(t, mux, "room=green&date=2026-08-24"); count != 0 {
+		t.Fatalf("броней в выдаче = %d, хотим 0", count)
+	}
+	if rec := restore(t, mux, b.ID); rec.Code != http.StatusGone {
+		t.Fatalf("повторный restore: код %d, хотим %d", rec.Code, http.StatusGone)
+	}
+}
+
+func TestRestore_ActiveBooking_BadRequest(t *testing.T) {
+	now := testNow
+	mux := newServerAtTime(func() time.Time { return now })
+	b := createBooking(t, mux, `{"room":"green","start":"2026-08-24T10:00:00Z","end":"2026-08-24T11:00:00Z"}`)
+
+	rec := restore(t, mux, b.ID)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("код ответа = %d, хотим %d; тело %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	assertErrorBody(t, rec)
+
+	got, count := listCount(t, mux, "room=green&date=2026-08-24")
+	if count != 1 {
+		t.Fatalf("броней в выдаче = %d, хотим 1", count)
+	}
+	if got.Bookings[0].Start.Format("15:04") != "10:00" || got.Bookings[0].End.Format("15:04") != "11:00" {
+		t.Fatalf("бронь изменилась: %s–%s", got.Bookings[0].Start, got.Bookings[0].End)
+	}
+}
+
+func TestRestore_AfterSuccessfulRestore_BadRequest(t *testing.T) {
+	now := testNow
+	mux := newServerAtTime(func() time.Time { return now })
+	b := createBooking(t, mux, `{"room":"green","start":"2026-08-24T10:00:00Z","end":"2026-08-24T11:00:00Z"}`)
+	cancelAndAdvance(t, mux, &now, b.ID, time.Minute)
+	if rec := restore(t, mux, b.ID); rec.Code != http.StatusOK {
+		t.Fatalf("первый restore: код %d, тело %s", rec.Code, rec.Body.String())
+	}
+
+	rec := restore(t, mux, b.ID)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("код ответа = %d, хотим %d; тело %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	assertErrorBody(t, rec)
+}
+
+func TestRestore_SlotTaken_ConflictAndNoSideEffects(t *testing.T) {
+	now := testNow
+	mux := newServerAtTime(func() time.Time { return now })
+	a := createBooking(t, mux, `{"room":"green","start":"2026-08-24T10:00:00Z","end":"2026-08-24T11:00:00Z"}`)
+	cancelAndAdvance(t, mux, &now, a.ID, time.Minute)
+	b := createBooking(t, mux, `{"room":"green","start":"2026-08-24T10:30:00Z","end":"2026-08-24T11:30:00Z"}`)
+	now = testNow.Add(2 * time.Minute)
+
+	rec := restore(t, mux, a.ID)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("код ответа = %d, хотим %d; тело %s", rec.Code, http.StatusConflict, rec.Body.String())
+	}
+	assertErrorBody(t, rec)
+
+	got, count := listCount(t, mux, "room=green&date=2026-08-24")
+	if count != 1 {
+		t.Fatalf("броней в выдаче = %d, хотим 1", count)
+	}
+	if got.Bookings[0].ID != b.ID {
+		t.Fatalf("в выдаче бронь %s, хотим %s", got.Bookings[0].ID, b.ID)
+	}
+	if rec := restore(t, mux, a.ID); rec.Code != http.StatusConflict {
+		t.Fatalf("повторный restore: код %d, хотим %d", rec.Code, http.StatusConflict)
+	}
+}
+
+func TestRestore_AdjacentBooking_Restored(t *testing.T) {
+	now := testNow
+	mux := newServerAtTime(func() time.Time { return now })
+	a := createBooking(t, mux, `{"room":"green","start":"2026-08-24T10:00:00Z","end":"2026-08-24T11:00:00Z"}`)
+	cancelAndAdvance(t, mux, &now, a.ID, time.Minute)
+	createBooking(t, mux, `{"room":"green","start":"2026-08-24T11:00:00Z","end":"2026-08-24T12:00:00Z"}`)
+	now = testNow.Add(2 * time.Minute)
+
+	rec := restore(t, mux, a.ID)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("код ответа = %d, хотим %d; тело %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if _, count := listCount(t, mux, "room=green&date=2026-08-24"); count != 2 {
+		t.Fatalf("броней в выдаче = %d, хотим 2", count)
+	}
+}
+
+func TestRestore_AfterSecondCancel_NewWindow(t *testing.T) {
+	now := testNow
+	mux := newServerAtTime(func() time.Time { return now })
+	b := createBooking(t, mux, `{"room":"green","start":"2026-08-24T10:00:00Z","end":"2026-08-24T11:00:00Z"}`)
+
+	cancelAndAdvance(t, mux, &now, b.ID, time.Minute)
+	if rec := restore(t, mux, b.ID); rec.Code != http.StatusOK {
+		t.Fatalf("первый restore: код %d, тело %s", rec.Code, rec.Body.String())
+	}
+
+	now = testNow.Add(10 * time.Minute)
+	cancelAndAdvance(t, mux, &now, b.ID, 0)
+	now = testNow.Add(13 * time.Minute)
+
+	rec := restore(t, mux, b.ID)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("код ответа = %d, хотим %d; тело %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var got Booking
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("разобрать ответ: %v", err)
+	}
+	if got.ID != b.ID || got.Room != "green" {
+		t.Fatalf("восстановленная бронь = %+v, хотим id %s green", got, b.ID)
 	}
 }
 
