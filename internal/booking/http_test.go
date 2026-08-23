@@ -31,6 +31,27 @@ func get(t *testing.T, mux *http.ServeMux, query string) *httptest.ResponseRecor
 	return rec
 }
 
+func del(t *testing.T, mux *http.ServeMux, id string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodDelete, "/bookings/"+id, nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	return rec
+}
+
+func createBooking(t *testing.T, mux *http.ServeMux, body string) Booking {
+	t.Helper()
+	rec := post(t, mux, body)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("подготовка брони %s: код %d, тело %s", body, rec.Code, rec.Body.String())
+	}
+	var b Booking
+	if err := json.Unmarshal(rec.Body.Bytes(), &b); err != nil {
+		t.Fatalf("разобрать ответ: %v", err)
+	}
+	return b
+}
+
 func TestCreateSuccess(t *testing.T) {
 	mux := newServer()
 
@@ -280,6 +301,159 @@ func TestCreateConcurrent(t *testing.T) {
 
 	if created != 1 {
 		t.Fatalf("успешных броней = %d, хотим 1", created)
+	}
+	if len(other) != 0 {
+		t.Fatalf("неожиданные коды ответов: %v", other)
+	}
+}
+
+func TestDeleteSuccess(t *testing.T) {
+	mux := newServer()
+	b := createBooking(t, mux, `{"room":"green","start":"2026-08-24T10:00:00Z","end":"2026-08-24T11:00:00Z"}`)
+
+	rec := del(t, mux, b.ID)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("код ответа = %d, хотим %d; тело %s", rec.Code, http.StatusNoContent, rec.Body.String())
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("тело ответа не пустое: %s", rec.Body.String())
+	}
+
+	list := get(t, mux, "room=green&date=2026-08-24")
+	var got listResponse
+	if err := json.Unmarshal(list.Body.Bytes(), &got); err != nil {
+		t.Fatalf("разобрать ответ: %v", err)
+	}
+	if len(got.Bookings) != 0 {
+		t.Fatalf("после отмены осталось броней = %d, хотим 0 (%s)", len(got.Bookings), list.Body.String())
+	}
+}
+
+func TestDeleteNotFound(t *testing.T) {
+	tests := []struct {
+		name string
+		id   func(t *testing.T, mux *http.ServeMux) string
+	}{
+		{
+			name: "неизвестный id",
+			id:   func(*testing.T, *http.ServeMux) string { return "0123456789abcdef" },
+		},
+		{
+			name: "id не в формате хранилища",
+			id:   func(*testing.T, *http.ServeMux) string { return "не-id" },
+		},
+		{
+			name: "повторная отмена",
+			id: func(t *testing.T, mux *http.ServeMux) string {
+				b := createBooking(t, mux, `{"room":"green","start":"2026-08-24T10:00:00Z","end":"2026-08-24T11:00:00Z"}`)
+				if rec := del(t, mux, b.ID); rec.Code != http.StatusNoContent {
+					t.Fatalf("первая отмена: код %d, тело %s", rec.Code, rec.Body.String())
+				}
+				return b.ID
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mux := newServer()
+			rec := del(t, mux, tt.id(t, mux))
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("код ответа = %d, хотим %d; тело %s", rec.Code, http.StatusNotFound, rec.Body.String())
+			}
+			assertErrorBody(t, rec)
+		})
+	}
+}
+
+func TestDeleteFreesInterval(t *testing.T) {
+	mux := newServer()
+	body := `{"room":"green","start":"2026-08-24T10:00:00Z","end":"2026-08-24T11:00:00Z"}`
+	b := createBooking(t, mux, body)
+
+	if rec := post(t, mux, body); rec.Code != http.StatusConflict {
+		t.Fatalf("до отмены: код %d, хотим %d; тело %s", rec.Code, http.StatusConflict, rec.Body.String())
+	}
+	if rec := del(t, mux, b.ID); rec.Code != http.StatusNoContent {
+		t.Fatalf("отмена: код %d, тело %s", rec.Code, rec.Body.String())
+	}
+	if rec := post(t, mux, body); rec.Code != http.StatusCreated {
+		t.Fatalf("после отмены: код %d, хотим %d; тело %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+}
+
+func TestDeleteKeepsOtherBookings(t *testing.T) {
+	mux := newServer()
+	target := createBooking(t, mux, `{"room":"green","start":"2026-08-24T12:00:00Z","end":"2026-08-24T13:00:00Z"}`)
+	createBooking(t, mux, `{"room":"green","start":"2026-08-24T09:00:00Z","end":"2026-08-24T10:00:00Z"}`)
+	createBooking(t, mux, `{"room":"green","start":"2026-08-24T15:00:00Z","end":"2026-08-24T16:00:00Z"}`)
+	createBooking(t, mux, `{"room":"red","start":"2026-08-24T12:00:00Z","end":"2026-08-24T13:00:00Z"}`)
+
+	if rec := del(t, mux, target.ID); rec.Code != http.StatusNoContent {
+		t.Fatalf("отмена: код %d, тело %s", rec.Code, rec.Body.String())
+	}
+
+	tests := []struct {
+		name  string
+		query string
+		want  []string
+	}{
+		{name: "комната с отменённой бронью", query: "room=green&date=2026-08-24", want: []string{"09:00", "15:00"}},
+		{name: "соседняя комната", query: "room=red&date=2026-08-24", want: []string{"12:00"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := get(t, mux, tt.query)
+			var got listResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+				t.Fatalf("разобрать ответ: %v", err)
+			}
+			if len(got.Bookings) != len(tt.want) {
+				t.Fatalf("броней = %d, хотим %d (%s)", len(got.Bookings), len(tt.want), rec.Body.String())
+			}
+			for i, want := range tt.want {
+				if got := got.Bookings[i].Start.Format("15:04"); got != want {
+					t.Fatalf("бронь %d начинается в %s, хотим %s", i, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestDeleteConcurrent(t *testing.T) {
+	mux := newServer()
+	b := createBooking(t, mux, `{"room":"green","start":"2026-08-24T10:00:00Z","end":"2026-08-24T11:00:00Z"}`)
+
+	const goroutines = 50
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		deleted int
+		other   []int
+	)
+
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			rec := del(t, mux, b.ID)
+
+			mu.Lock()
+			defer mu.Unlock()
+			switch rec.Code {
+			case http.StatusNoContent:
+				deleted++
+			case http.StatusNotFound:
+			default:
+				other = append(other, rec.Code)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if deleted != 1 {
+		t.Fatalf("успешных отмен = %d, хотим 1", deleted)
 	}
 	if len(other) != 0 {
 		t.Fatalf("неожиданные коды ответов: %v", other)

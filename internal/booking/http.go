@@ -20,6 +20,7 @@ func NewHandler(store *Store) *Handler {
 func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /bookings", h.create)
 	mux.HandleFunc("GET /bookings", h.list)
+	mux.HandleFunc("DELETE /bookings/{id}", h.cancel)
 }
 
 type createRequest struct {
@@ -91,6 +92,20 @@ func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, listResponse{Bookings: h.store.ListByDate(room, date)})
+}
+
+func (h *Handler) cancel(w http.ResponseWriter, r *http.Request) {
+	err := h.store.Delete(r.PathValue("id"))
+	if errors.Is(err, ErrNotFound) {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "внутренняя ошибка")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func parseUTC(raw string) (time.Time, error) {
