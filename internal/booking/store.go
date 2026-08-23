@@ -8,17 +8,31 @@ import (
 )
 
 var (
-	ErrConflict = errors.New("комната уже занята на это время")
-	ErrNotFound = errors.New("брони с таким id нет")
+	ErrConflict      = errors.New("комната уже занята на это время")
+	ErrNotFound      = errors.New("брони с таким id нет")
+	ErrRestoreWindow = errors.New("окно восстановления истекло")
 )
 
-type Store struct {
-	mu    sync.RWMutex
-	rooms map[string][]Booking
+type cancelled struct {
+	b           Booking
+	cancelledAt time.Time
 }
 
-func NewStore() *Store {
-	return &Store{rooms: make(map[string][]Booking)}
+type Store struct {
+	mu            sync.RWMutex
+	rooms         map[string][]Booking
+	cancelled     map[string]cancelled
+	restoreWindow time.Duration
+	now           func() time.Time
+}
+
+func NewStore(restoreWindow time.Duration) *Store {
+	return &Store{
+		rooms:         make(map[string][]Booking),
+		cancelled:     make(map[string]cancelled),
+		restoreWindow: restoreWindow,
+		now:           time.Now,
+	}
 }
 
 func (s *Store) Create(room string, start, end time.Time) (Booking, error) {
@@ -30,10 +44,8 @@ func (s *Store) Create(room string, start, end time.Time) (Booking, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for _, b := range s.rooms[room] {
-		if start.Before(b.End) && b.Start.Before(end) {
-			return Booking{}, ErrConflict
-		}
+	if s.conflict(room, start, end) {
+		return Booking{}, ErrConflict
 	}
 
 	b := Booking{ID: id, Room: room, Start: start, End: end}
@@ -54,10 +66,41 @@ func (s *Store) Delete(id string) error {
 			if len(s.rooms[room]) == 0 {
 				delete(s.rooms, room)
 			}
+			s.cancelled[id] = cancelled{b: b, cancelledAt: s.now()}
 			return nil
 		}
 	}
 	return ErrNotFound
+}
+
+func (s *Store) Restore(id string) (Booking, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	c, ok := s.cancelled[id]
+	if !ok {
+		return Booking{}, ErrNotFound
+	}
+	if !s.now().Before(c.cancelledAt.Add(s.restoreWindow)) {
+		return Booking{}, ErrRestoreWindow
+	}
+	if s.conflict(c.b.Room, c.b.Start, c.b.End) {
+		return Booking{}, ErrConflict
+	}
+
+	delete(s.cancelled, id)
+	s.rooms[c.b.Room] = append(s.rooms[c.b.Room], c.b)
+	return c.b, nil
+}
+
+// conflict вызывается под блокировкой s.mu.
+func (s *Store) conflict(room string, start, end time.Time) bool {
+	for _, b := range s.rooms[room] {
+		if start.Before(b.End) && b.Start.Before(end) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) ListByDate(room string, date time.Time) []Booking {
