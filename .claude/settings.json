@@ -1,0 +1,52 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(gofmt:*)",
+      "Bash(go build:*)",
+      "Bash(go test:*)",
+      "Bash(go vet:*)",
+      "Bash(go doc:*)",
+      "Bash(go list:*)",
+      "Bash(go tool cover:*)",
+      "Bash(go mod tidy:*)",
+      "Bash(golangci-lint run:*)",
+      "Bash(make ai-check:*)",
+      "Bash(make test:*)",
+      "Bash(make test-coverage:*)",
+      "Bash(make lint:*)",
+      "Bash(make gen:*)",
+      "Bash(make coverage:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git branch:*)",
+      "Bash(git commit:*)",
+      "Bash(git add:*)"
+    ],
+    "deny": [
+      "Bash(gh pr create:*)",
+      "Bash(git push:*)",
+      "Bash(glab mr create:*)",
+      "Bash(glab mr merge:*)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/gofmt.sh",
+            "statusMessage": "gofmt"
+          }
+        ]
+      }
+    ]
+  },
+  "includeCoAuthoredBy": false,
+  "worktree": {
+    "bgIsolation": "none"
+  }
+}
