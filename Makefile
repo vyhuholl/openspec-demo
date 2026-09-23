@@ -22,7 +22,7 @@ help:
 
 .PHONY: run
 run:
-	PORT=$(PORT) $(GO) run ./cmd/booking
+	PORT=$(PORT) $(GO) run -race ./cmd/booking
 
 .PHONY: build
 build:
