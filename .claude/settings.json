@@ -15,16 +15,16 @@
       "Bash(make test-coverage:*)",
       "Bash(make lint:*)",
       "Bash(make gen:*)",
-      "Bash(make coverage:*)",
+      "Bash(make coverage:*)"
+    ],
+    "deny": [
       "Bash(git status:*)",
       "Bash(git diff:*)",
       "Bash(git log:*)",
       "Bash(git show:*)",
       "Bash(git branch:*)",
       "Bash(git commit:*)",
-      "Bash(git add:*)"
-    ],
-    "deny": [
+      "Bash(git add:*)",
       "Bash(gh pr create:*)",
       "Bash(git push:*)",
       "Bash(glab mr create:*)",
