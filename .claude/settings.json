@@ -15,7 +15,7 @@
       "Bash(make test-coverage:*)",
       "Bash(make lint:*)",
       "Bash(make gen:*)",
-      "Bash(make coverage:*)",
+      "Bash(make coverage:*)"
     ],
     "deny": [
       "Bash(git status:*)",
